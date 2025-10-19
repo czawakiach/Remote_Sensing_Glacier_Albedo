@@ -1,0 +1,603 @@
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.transform import from_bounds
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from datetime import datetime, timedelta
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+import warnings
+warnings.filterwarnings('ignore')
+
+class SpatialAlbedoModelSnowfall:
+    """
+    Spatial albedo modeling using SNOWFALL-DOMINATED approach with 
+    ELEVATION-DEPENDENT snowfall probability calculation.
+    
+    Key Feature: Snowfall probability is calculated at each grid point based on:
+    - Local temperature (using lapse rate)
+    - Orographically-corrected precipitation
+    
+    Uses glacier-specific AWS stations to avoid temperature inversion artifacts.
+    """
+    
+    def __init__(self, dem_paths, aws_data_paths, station_elevations, glacier_to_stations):
+        """
+        Initialize the spatial albedo model (Snowfall-Dominated version with elevation-dependent probability)
+        
+        Parameters:
+        dem_paths (dict): Paths to DEM files for each glacier
+        aws_data_paths (dict): Paths to AWS station data files  
+        station_elevations (dict): Elevation of each AWS station in meters
+        glacier_to_stations (dict): Mapping of glacier names to their AWS stations
+        """
+        self.dem_paths = dem_paths
+        self.aws_data_paths = aws_data_paths
+        self.station_elevations = station_elevations
+        self.glacier_to_stations = glacier_to_stations
+        
+        # Hornsund station elevation for precipitation reference
+        self.hornsund_elevation = 10  # meters
+        
+        # Storage for loaded data and trained models
+        self.dems = {}
+        self.aws_data = {}
+        self.model = None
+        self.imputer = None
+        
+    def load_dems(self):
+        """Load Digital Elevation Model data for each glacier"""
+        for glacier_name, dem_path in self.dem_paths.items():
+            try:
+                with rasterio.open(dem_path) as src:
+                    elevation = src.read(1)
+                    transform = src.transform
+                    crs = src.crs
+                    
+                    # Handle NoData values
+                    elevation = elevation.astype(float)
+                    elevation[elevation <= -9999] = np.nan
+                    
+                    # Create coordinate arrays
+                    height, width = elevation.shape
+                    cols, rows = np.meshgrid(np.arange(width), np.arange(height))
+                    xs, ys = rasterio.transform.xy(transform, rows, cols)
+                    
+                    # Store DEM data
+                    self.dems[glacier_name] = {
+                        'elevation': elevation,
+                        'transform': transform,
+                        'crs': crs,
+                        'x_coords': np.array(xs),
+                        'y_coords': np.array(ys),
+                        'shape': elevation.shape
+                    }
+                    
+                print(f"Loaded DEM for {glacier_name}: {elevation.shape}")
+                
+                # Report statistics
+                valid_elevation = elevation[~np.isnan(elevation)]
+                if len(valid_elevation) > 0:
+                    print(f"  Elevation range: {np.min(valid_elevation):.1f} - {np.max(valid_elevation):.1f} m")
+                    print(f"  Valid pixels: {len(valid_elevation):,} / {elevation.size:,}")
+                
+            except Exception as e:
+                print(f"Error loading DEM for {glacier_name}: {e}")
+    
+    def load_aws_data(self):
+        """Load Automatic Weather Station data"""
+        for station_name, data_path in self.aws_data_paths.items():
+            try:
+                df = pd.read_csv(data_path)
+                df['date'] = pd.to_datetime(df['date'])
+                
+                # Remove rows with missing albedo
+                initial_len = len(df)
+                df = df.dropna(subset=['albedo'])
+                final_len = len(df)
+                
+                self.aws_data[station_name] = df
+                print(f"Loaded AWS data for {station_name}: {final_len:,} records")
+                if initial_len != final_len:
+                    print(f"  Removed {initial_len-final_len} records with missing albedo")
+                print(f"  Date range: {df['date'].min()} to {df['date'].max()}")
+                
+                # Check for required columns
+                required_cols = ['date', 'albedo', 'TC', 'PDD', 'snowfall_probability', 
+                               'day_of_year', 'precipitation']
+                missing_cols = [col for col in required_cols if col not in df.columns]
+                if missing_cols:
+                    print(f"  Warning: Missing columns in {station_name}: {missing_cols}")
+                
+            except Exception as e:
+                print(f"Error loading AWS data for {station_name}: {e}")
+    
+    def calculate_topographic_variables(self, glacier_name):
+        """Calculate slope and aspect from DEM"""
+        dem_data = self.dems[glacier_name]
+        elevation = dem_data['elevation']
+        
+        dy, dx = np.gradient(elevation)
+        slope = np.arctan(np.sqrt(dx**2 + dy**2)) * 180 / np.pi
+        aspect = np.arctan2(-dx, dy) * 180 / np.pi
+        aspect[aspect < 0] += 360
+        
+        self.dems[glacier_name]['slope'] = slope
+        self.dems[glacier_name]['aspect'] = aspect
+        
+        print(f"Calculated topographic variables for {glacier_name}")
+        return slope, aspect
+    
+    def train_model_from_data(self):
+        """
+        Train linear regression model using SNOWFALL-DOMINATED approach.
+        Features emphasize snowfall probability over thermal processes.
+        """
+        # Combine data from all AWS stations
+        all_data = []
+        for station_name, df in self.aws_data.items():
+            station_df = df.copy()
+            station_df['elevation'] = self.station_elevations[station_name]
+            all_data.append(station_df)
+        
+        combined_df = pd.concat(all_data, ignore_index=True)
+        combined_df = combined_df.dropna(subset=['albedo'])
+        
+        print(f"Training dataset: {len(combined_df):,} records from {len(self.aws_data)} stations")
+        
+        # SNOWFALL-DOMINATED FEATURES
+        # Order emphasizes snowfall probability
+        feature_cols = ['day_of_year', 'TC', 'daily_positive_temp', 'PDD', 
+                       'snowfall_probability', 'elevation']
+        
+        # Check for missing features
+        missing_features = [col for col in feature_cols if col not in combined_df.columns]
+        if missing_features:
+            print(f"Warning: Missing feature columns: {missing_features}")
+            feature_cols = [col for col in feature_cols if col in combined_df.columns]
+            print(f"Using available features: {feature_cols}")
+        
+        X = combined_df[feature_cols]
+        y = combined_df['albedo']
+        
+        # Handle missing values
+        self.imputer = SimpleImputer(strategy='mean')
+        X_clean = self.imputer.fit_transform(X)
+        
+        # Train linear regression model
+        self.model = LinearRegression()
+        self.model.fit(X_clean, y)
+        
+        self.feature_names = feature_cols
+        
+        # Report performance
+        r2_score = self.model.score(X_clean, y)
+        print(f"Trained SNOWFALL-DOMINATED linear regression model:")
+        print(f"  Features: {feature_cols}")
+        print(f"  R² score: {r2_score:.2f}")
+        
+        # Calculate feature importance
+        coefficients = dict(zip(feature_cols, self.model.coef_))
+        print(f"  Model coefficients: {coefficients}")
+        print(f"  Model intercept: {self.model.intercept_:.2f}")
+        
+        # Analyze snowfall vs thermal dominance
+        abs_coeffs = np.abs(self.model.coef_)
+        normalized_importance = abs_coeffs / np.sum(abs_coeffs)
+        importance_dict = dict(zip(feature_cols, normalized_importance))
+        
+        snowfall_importance = importance_dict.get('snowfall_probability', 0)
+        thermal_features = ['TC', 'daily_positive_temp', 'PDD']
+        thermal_importance = sum(importance_dict.get(f, 0) for f in thermal_features)
+        
+        print(f"\n  Process Dominance:")
+        print(f"    Snowfall processes (snowfall_probability): {snowfall_importance:.1%}")
+        print(f"    Thermal processes (TC + daily_positive_temp + PDD): {thermal_importance:.1%}")
+        
+        if snowfall_importance > thermal_importance:
+            print(f"    → SNOWFALL DOMINANCE confirmed in spatial model")
+        
+        return self.model
+    
+    def calculate_temperature_probability(self, temperature):
+        """
+        Calculate snowfall probability based on temperature using sigmoid function.
+        Same formula as in SnowfallAnalyzer class.
+        
+        Parameters:
+        temperature (array): Air temperature in °C
+        
+        Returns:
+        array: Temperature-based probability (0-1)
+        """
+        k = 1.5   # Transition steepness
+        t0 = 1.0  # Temperature threshold (°C)
+        
+        return 1 / (1 + np.exp(k * (temperature - t0)))
+    
+    def calculate_precipitation_probability(self, precipitation):
+        """
+        Calculate snowfall probability based on precipitation using piecewise function.
+        Same formula as in SnowfallAnalyzer class.
+        
+        Parameters:
+        precipitation (array): Precipitation amount in mm
+        
+        Returns:
+        array: Precipitation-based probability (0-1)
+        """
+        min_threshold = 0.1  # Minimum measurable precipitation (mm)
+        max_threshold = 5.0  # Maximum for scaling (mm)
+        
+        result = np.zeros_like(precipitation, dtype=float)
+        
+        # Trace precipitation
+        light_precip_mask = (precipitation > 0) & (precipitation < min_threshold)
+        result[light_precip_mask] = 0.2
+        
+        # Measurable precipitation: logarithmic scaling
+        sig_precip_mask = precipitation >= min_threshold
+        if np.any(sig_precip_mask):
+            scaled_precip = (np.log10(precipitation[sig_precip_mask] / min_threshold) / 
+                           np.log10(max_threshold / min_threshold))
+            result[sig_precip_mask] = np.minimum(scaled_precip, 1.0)
+        
+        return result
+    
+    def interpolate_meteorological_variables(self, glacier_name, target_date, lapse_rate_temp=-0.0053):
+        """
+        Interpolate meteorological variables with ELEVATION-DEPENDENT snowfall probability.
+        
+        KEY FEATURE: Snowfall probability is calculated at each grid point based on:
+        1. Local temperature (using lapse rate from station)
+        2. Orographically-corrected precipitation
+        
+        Parameters:
+        glacier_name (str): Name of target glacier
+        target_date (datetime): Date for interpolation
+        lapse_rate_temp (float): Temperature lapse rate (°C/m) = -0.53°C/100m
+        
+        Returns:
+        dict: Interpolated meteorological variables on glacier grid
+        """
+        dem_data = self.dems[glacier_name]
+        elevation_grid = dem_data['elevation']
+        
+        # Get glacier-specific stations
+        allowed_stations = self.glacier_to_stations.get(glacier_name, [])
+        print(f"  Using stations for {glacier_name}: {allowed_stations}")
+        
+        # Extract station data for target date
+        station_data_list = []
+        
+        for station_name in allowed_stations:
+            if station_name in self.aws_data:
+                station_df = self.aws_data[station_name]
+                
+                station_df['date_only'] = station_df['date'].dt.date
+                target_date_only = target_date.date()
+                date_mask = station_df['date_only'] == target_date_only
+                
+                if date_mask.any():
+                    station_data = station_df[date_mask].iloc[0]
+                    station_elevation = self.station_elevations[station_name]
+                    station_data_list.append((station_name, station_data, station_elevation))
+                    print(f"  Found data for {station_name} on {target_date_only}")
+                else:
+                    print(f"  No data for {station_name} on {target_date_only}")
+        
+        if not station_data_list:
+            print(f"  No station data available for {target_date}")
+            return None
+        
+        # Use the first (and typically only) station for this glacier
+        station_name, station_data, station_elevation = station_data_list[0]
+        
+        interpolated_vars = {}
+        
+        # === CRITICAL: Calculate elevation-dependent snowfall probability ===
+        
+        # Step 1: Calculate temperature at each grid point
+        if 'TC' in station_data:
+            station_temp = station_data['TC']
+            temp_grid = station_temp + lapse_rate_temp * (elevation_grid - station_elevation)
+            interpolated_vars['TC'] = temp_grid
+            
+            # Step 2: Calculate temperature-based snowfall probability at each grid point
+            temp_probability_grid = self.calculate_temperature_probability(temp_grid)
+            
+            print(f"  Temperature probability range: {np.nanmin(temp_probability_grid):.2f} - {np.nanmax(temp_probability_grid):.2f}")
+        else:
+            print(f"  Warning: No temperature data available")
+            return None
+        
+        # Step 3: Apply orographic precipitation correction based on elevation
+        if 'precipitation' in station_data:
+            station_precip = station_data['precipitation']
+            
+            # Calculate elevation difference from Hornsund reference
+            elevation_diff = elevation_grid - self.hornsund_elevation
+            
+            # Apply orographic gradient: 19% per 100m
+            orographic_gradient = 0.19
+            correction_factor = 1 + (elevation_diff / 100) * orographic_gradient
+            
+            # Ensure correction factor is reasonable (not negative)
+            correction_factor = np.maximum(correction_factor, 0.5)
+            
+            # Calculate corrected precipitation at each grid point
+            corrected_precip_grid = station_precip * correction_factor
+            
+            # Step 4: Calculate precipitation probability at each grid point
+            precip_probability_grid = self.calculate_precipitation_probability(corrected_precip_grid)
+            
+            print(f"  Precipitation probability range: {np.nanmin(precip_probability_grid):.2f} - {np.nanmax(precip_probability_grid):.2f}")
+        else:
+            print(f"  Warning: No precipitation data available")
+            return None
+        
+        # Step 5: Calculate final snowfall probability (multiplicative model)
+        snowfall_probability_grid = temp_probability_grid * precip_probability_grid
+        
+        # Clip to valid range [0, 1]
+        snowfall_probability_grid = np.clip(snowfall_probability_grid, 0, 1)
+        
+        interpolated_vars['snowfall_probability'] = snowfall_probability_grid
+        
+        print(f"  Final snowfall probability range: {np.nanmin(snowfall_probability_grid):.2f} - {np.nanmax(snowfall_probability_grid):.2f}")
+        print(f"  Mean snowfall probability: {np.nanmean(snowfall_probability_grid):.2f}")
+        
+        # Step 6: Other variables (constant from station or elevation-dependent)
+        
+        # Daily positive temperature (elevation-dependent, based on temp_grid)
+        if 'daily_positive_temp' in station_data:
+            # Calculate based on local temperature
+            daily_positive_temp_grid = np.maximum(temp_grid, 0)
+            interpolated_vars['daily_positive_temp'] = daily_positive_temp_grid
+        
+        # PDD (use constant from station - cumulative value)
+        if 'PDD' in station_data:
+            interpolated_vars['PDD'] = np.full_like(elevation_grid, station_data['PDD'])
+        
+        return interpolated_vars
+    
+    def predict_spatial_albedo(self, glacier_name, target_date, day_of_year=None):
+        """
+        Predict albedo across glacier surface using snowfall-dominated model
+        with elevation-dependent snowfall probability
+        
+        Parameters:
+        glacier_name (str): Name of target glacier
+        target_date (datetime): Date for prediction
+        day_of_year (int): Day of year (calculated if not provided)
+        
+        Returns:
+        numpy.ndarray: Predicted albedo values
+        """
+        if day_of_year is None:
+            day_of_year = target_date.timetuple().tm_yday
+        
+        print(f"Predicting albedo for {glacier_name} on {target_date.strftime('%Y-%m-%d')}")
+        
+        # Get interpolated meteorological variables (with elevation-dependent snowfall probability)
+        met_vars = self.interpolate_meteorological_variables(glacier_name, target_date)
+        if met_vars is None:
+            print("  Cannot predict: no meteorological data available")
+            return None
+        
+        # Get elevation data
+        dem_data = self.dems[glacier_name]
+        elevation = dem_data['elevation']
+        shape = elevation.shape
+        
+        # Prepare feature arrays
+        features = {
+            'day_of_year': np.full(shape, day_of_year),
+            'TC': met_vars.get('TC', np.full(shape, np.nan)),
+            'daily_positive_temp': met_vars.get('daily_positive_temp', np.full(shape, np.nan)),
+            'PDD': met_vars.get('PDD', np.full(shape, np.nan)),
+            'snowfall_probability': met_vars.get('snowfall_probability', np.full(shape, np.nan)),
+            'elevation': elevation
+        }
+        
+        # Create feature matrix for valid pixels
+        valid_mask = ~np.isnan(elevation)
+        if not np.any(valid_mask):
+            print("  No valid elevation data")
+            return None
+        
+        # Stack features
+        feature_list = []
+        for feature_name in self.feature_names:
+            if feature_name in features:
+                feature_list.append(features[feature_name][valid_mask])
+            else:
+                print(f"  Warning: Feature {feature_name} not available, using zeros")
+                feature_list.append(np.zeros(np.sum(valid_mask)))
+        
+        feature_stack = np.column_stack(feature_list)
+        
+        # Apply imputation
+        feature_stack_clean = self.imputer.transform(feature_stack)
+        
+        # Predict albedo
+        albedo_values = self.model.predict(feature_stack_clean)
+        
+        # Create output array
+        albedo_predicted = np.full(shape, np.nan)
+        albedo_predicted[valid_mask] = albedo_values
+        
+        # Clip to valid range
+        albedo_predicted = np.clip(albedo_predicted, 0, 1)
+        
+        print(f"  Predicted albedo for {np.sum(valid_mask):,} pixels")
+        print(f"  Predicted albedo range: {np.nanmin(albedo_predicted):.2f} - {np.nanmax(albedo_predicted):.2f}")
+        print(f"  Mean predicted albedo: {np.nanmean(albedo_predicted):.2f}")
+        
+        return albedo_predicted
+    
+    def visualize_spatial_albedo(self, glacier_name, albedo_array, target_date, save_path=None, figsize=(12, 6)):
+        """
+        Visualize elevation and predicted albedo side-by-side
+        """
+        dem_data = self.dems[glacier_name]
+        elevation = dem_data['elevation']
+        
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        
+        # Plot 1: Elevation
+        im1 = axes[0].imshow(elevation, cmap='terrain', alpha=0.8)
+        axes[0].set_title(f'{glacier_name} - Elevation (m)', fontsize=12, fontweight='bold')
+        axes[0].set_xlabel('Grid X')
+        axes[0].set_ylabel('Grid Y')
+        plt.colorbar(im1, ax=axes[0], shrink=0.8, label='Elevation (m)')
+        
+        # Plot 2: Albedo
+        albedo_cmap = LinearSegmentedColormap.from_list(
+            'albedo', ['darkblue', 'blue', 'lightblue', 'white'], N=256
+        )
+        
+        im2 = axes[1].imshow(albedo_array, cmap=albedo_cmap, vmin=0, vmax=1)
+        axes[1].set_title(f'{glacier_name} - Predicted Albedo (Snowfall Model)\n{target_date.strftime("%Y-%m-%d")}', 
+                         fontsize=12, fontweight='bold')
+        axes[1].set_xlabel('Grid X')
+        axes[1].set_ylabel('Grid Y')
+        plt.colorbar(im2, ax=axes[1], shrink=0.8, label='Albedo')
+        
+        # Clean appearance
+        for ax in axes:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"  Saved visualization to {save_path}")
+        
+        plt.show()
+        
+        # Statistics
+        valid_albedo = albedo_array[~np.isnan(albedo_array)]
+        if len(valid_albedo) > 0:
+            print(f"\nAlbedo Statistics for {glacier_name}:")
+            print(f"  Mean: {np.mean(valid_albedo):.2f}")
+            print(f"  Std: {np.std(valid_albedo):.2f}")
+            print(f"  Range: {np.min(valid_albedo):.2f} - {np.max(valid_albedo):.2f}")
+            print(f"  Valid pixels: {len(valid_albedo):,}")
+    
+    def create_validation_predictions(self, glacier_names=None):
+        """
+        Create albedo predictions for validation dates
+        """
+        if glacier_names is None:
+            glacier_names = list(self.dems.keys())
+        
+        validation_dates = [
+            datetime(2011, 7, 26),
+            datetime(2011, 8, 20)
+        ]
+        
+        results = {}
+        
+        for date in validation_dates:
+            date_str = date.strftime('%Y-%m-%d')
+            results[date_str] = {}
+            
+            print(f"\n=== Processing {date_str} (Snowfall Model with Elevation-Dependent Probability) ===")
+            
+            for glacier_name in glacier_names:
+                print(f"\nPredicting albedo for {glacier_name}...")
+                
+                albedo_prediction = self.predict_spatial_albedo(glacier_name, date)
+                
+                if albedo_prediction is not None:
+                    results[date_str][glacier_name] = albedo_prediction
+                    
+                    save_path = f"{glacier_name}_albedo_prediction_SNOWFALL_{date.strftime('%Y%m%d')}.png"
+                    self.visualize_spatial_albedo(
+                        glacier_name, 
+                        albedo_prediction, 
+                        date,
+                        save_path=save_path
+                    )
+                else:
+                    print(f"  Failed to predict albedo for {glacier_name} on {date_str}")
+        
+        return results
+
+def main():
+    """
+    Main workflow for SNOWFALL-DOMINATED spatial albedo modeling
+    with ELEVATION-DEPENDENT snowfall probability
+    """
+    print("=== Spatial Albedo Modeling - SNOWFALL-DOMINATED with Elevation-Dependent Probability ===\n")
+    
+    # Define file paths
+    dem_paths = {
+        'Hansbreen': r"D:\PhD\1st_year\1st_article\DEM\Hansbreen_DEM.tif",
+        'Werenskioldbreen': r"D:\PhD\1st_year\1st_article\DEM\Werenskioldbreen_DEM.tif"
+    }
+    
+    aws_data_paths = {
+        'hans4': r"C:\Users\PC\PhD\2024_Hans_data\Albedo_Glacier_ML\processed_data\daily_ready\processed_probability\hans4_2011_snowfall_probability_clean.csv",
+        'hans9': r"C:\Users\PC\PhD\2024_Hans_data\Albedo_Glacier_ML\processed_data\daily_ready\processed_probability\hans9_2011_snowfall_probability_clean.csv",
+        'werenskiold': r"C:\Users\PC\PhD\2024_Hans_data\Albedo_Glacier_ML\processed_data\daily_ready\processed_probability\werenskiold_2011_snowfall_probability_clean.csv"
+    }
+    
+    station_elevations = {
+        'hans4': 190,    # AWS_H4
+        'hans9': 420,    # AWS_H9
+        'werenskiold': 380  # AWS_WRN
+    }
+    
+    # Glacier-specific stations (avoid temperature inversions)
+    glacier_to_stations = {
+        'Hansbreen': ['hans4'],  # Use only AWS_H4
+        'Werenskioldbreen': ['werenskiold']  # Use only AWS_WRN
+    }
+    
+    print("Configuration (Snowfall-Dominated Model with Elevation-Dependent Probability):")
+    print(f"  DEM files: {len(dem_paths)} glaciers")
+    print(f"  AWS data: {len(aws_data_paths)} stations")
+    print(f"  Glacier-to-station mapping: {glacier_to_stations}")
+    print(f"  Model emphasis: Snowfall probability (calculated at each elevation)")
+    print(f"  Snowfall probability method: Temperature + Orographic precipitation")
+    
+    # Initialize model
+    spatial_model = SpatialAlbedoModelSnowfall(
+        dem_paths, aws_data_paths, station_elevations, glacier_to_stations
+    )
+    
+    # Load data
+    print("\nLoading DEM and AWS data...")
+    spatial_model.load_dems()
+    spatial_model.load_aws_data()
+    
+    # Calculate topographic variables
+    print("\nCalculating topographic variables...")
+    for glacier_name in dem_paths.keys():
+        if glacier_name in spatial_model.dems:
+            spatial_model.calculate_topographic_variables(glacier_name)
+    
+    # Train snowfall-dominated model
+    print("\nTraining SNOWFALL-DOMINATED linear regression model...")
+    spatial_model.train_model_from_data()
+    
+    # Create predictions
+    print("\nCreating validation predictions...")
+    validation_results = spatial_model.create_validation_predictions()
+    
+    print("\n=== Snowfall-Dominated Spatial Modeling Complete ===")
+    print("Generated files:")
+    print("  - Albedo prediction maps with '_SNOWFALL_' suffix")
+    print("  - Snowfall probability calculated at each elevation")
+    print("  - Temperature lapse rate + orographic precipitation applied")
+    print("  - Glacier-specific stations (no temperature inversion)")
+    
+    return spatial_model, validation_results
+
+if __name__ == "__main__":
+    model, results = main()
