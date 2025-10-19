@@ -1,0 +1,484 @@
+"""
+Snowfall Probability Analysis for Svalbard Glaciers - Complete Version
+
+This script calculates snowfall probability using temperature and precipitation data
+from automatic weather stations on Hansbreen and Werenskiöldbreen glaciers, Svalbard.
+
+Key Features:
+- Temperature-based probability using sigmoid function around freezing point
+- Precipitation-based probability with logarithmic scaling
+- Orographic precipitation corrections for elevation differences
+- Model validation using surface albedo observations
+- Daily positive temperature and PDD (Positive Degree Days) calculations
+- Improved CSV output format (clean, compatible with all parsers)
+
+Dependencies: pandas, numpy, matplotlib, seaborn, pathlib
+
+New in v1.1:
+- Added daily_positive_temp column (daily positive temperature)
+- Added PDD column (cumulative positive degree days)
+- Enhanced summary statistics and metadata
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import os
+
+class SnowfallAnalyzer:
+    """
+    Analyzer for calculating snowfall probability on Svalbard glaciers using
+    temperature and precipitation data with orographic corrections.
+    """
+    
+    def __init__(self, base_path):
+        """
+        Initialize analyzer with data path and station metadata.
+        
+        Parameters:
+        base_path (str): Directory containing meteorological data files
+        """
+        self.base_path = Path(base_path)
+        
+        # AWS station elevations (m a.s.l.)
+        self.station_elevations = {
+            'hans4': 190,        # Hansbreen station 4
+            'hans9': 420,        # Hansbreen station 9  
+            'werenskiold': 380   # Werenskiöldbreen station
+        }
+        
+        # Reference elevation for precipitation data (Hornsund station)
+        self.hornsund_elevation = 10
+        
+    def calculate_temperature_probability(self, temperature):
+        """
+        Calculate snowfall probability based on air temperature using sigmoid function.
+        
+        Formula: P_temp = 1 / (1 + exp(1.5 * (T - 1.0)))
+        
+        Parameters:
+        temperature (array): Air temperature in °C
+        
+        Returns:
+        array: Temperature-based probability (0-1 scale)
+        """
+        k = 1.5   # Transition steepness parameter
+        t0 = 1.0  # Temperature threshold (°C)
+        
+        return 1 / (1 + np.exp(k * (temperature - t0)))
+    
+    def calculate_precipitation_probability(self, precipitation):
+        """
+        Calculate snowfall probability based on precipitation amount using
+        piecewise function with logarithmic scaling.
+        
+        Parameters:
+        precipitation (array): Precipitation amount in mm
+        
+        Returns:
+        array: Precipitation-based probability (0-1 scale)
+        """
+        min_threshold = 0.1  # Minimum measurable precipitation (mm)
+        max_threshold = 5.0  # Precipitation for maximum probability (mm)
+        
+        result = np.zeros_like(precipitation, dtype=float)
+        
+        # Trace precipitation (0 < precip < 0.1 mm): base probability
+        light_precip_mask = (precipitation > 0) & (precipitation < min_threshold)
+        result[light_precip_mask] = 0.2
+        
+        # Measurable precipitation: logarithmic scaling
+        sig_precip_mask = precipitation >= min_threshold
+        if np.any(sig_precip_mask):
+            scaled_precip = (np.log10(precipitation[sig_precip_mask] / min_threshold) / 
+                           np.log10(max_threshold / min_threshold))
+            result[sig_precip_mask] = np.minimum(scaled_precip, 1.0)
+        
+        return result
+    
+    def adjust_for_elevation(self, data, station):
+        """
+        Apply orographic precipitation correction (10% increase per 100m elevation).
+        
+        Parameters:
+        data (pd.DataFrame): Meteorological data with 'precipitation' column
+        station (str): Station identifier
+        
+        Returns:
+        pd.DataFrame: Data with elevation-corrected precipitation
+        """
+        elevation_diff = self.station_elevations[station] - self.hornsund_elevation
+        adjusted_data = data.copy()
+        
+        # Apply orographic correction
+        if 'precipitation' in adjusted_data.columns:
+            # Orographic precipitation gradient: change 0.1 to modify % increase per 100m
+            orographic_gradient = 0.19  # 19% increase per 100m elevation 
+            correction_factor = 1 + (elevation_diff / 100) * orographic_gradient
+            adjusted_data['precipitation'] = data['precipitation'] * correction_factor
+            
+        return adjusted_data
+
+    def process_station_data(self, station, year):
+        """
+        Process complete meteorological dataset for a station-year combination.
+        
+        Workflow:
+        1. Load glacier temperature and precipitation data
+        2. Merge datasets by date
+        3. Apply elevation corrections
+        4. Calculate temperature and precipitation probabilities
+        5. Compute final snowfall probability
+        6. Calculate daily positive temperature and PDD
+        
+        Parameters:
+        station (str): Station identifier
+        year (int): Year to process
+        
+        Returns:
+        pd.DataFrame or None: Processed data with snowfall probabilities
+        """
+        # Construct file paths
+        glacier_file = f"{station}_{year}_daily_ready.csv"
+        glacier_path = self.base_path / glacier_file
+        
+        precip_file = f"hornsund_{year}_precip.csv"
+        precip_path = self.base_path / precip_file
+        
+        # Check file existence
+        if not glacier_path.exists():
+            print(f"Warning: Glacier data file not found: {glacier_file}")
+            return None
+        if not precip_path.exists():
+            print(f"Warning: Precipitation data file not found: {precip_file}")
+            return None
+        
+        try:
+            # Load data
+            print(f"Loading glacier data: {glacier_file}")
+            glacier_data = pd.read_csv(glacier_path)
+            
+            print(f"Loading precipitation data: {precip_file}")
+            precip_data = pd.read_csv(precip_path)
+            
+            # Merge datasets on date
+            merged_data = pd.merge(glacier_data, 
+                                 precip_data[['date', 'precipitation']], 
+                                 on='date', how='left')
+            
+            print(f"Merged dataset: {len(merged_data)} daily records")
+            
+            # Apply elevation corrections
+            adjusted_data = self.adjust_for_elevation(merged_data, station)
+            
+            # Calculate probability components
+            temp_prob = self.calculate_temperature_probability(adjusted_data['TC'])
+            precip_prob = self.calculate_precipitation_probability(adjusted_data['precipitation'])
+            
+            # Final snowfall probability (multiplicative model)
+            snowfall_prob = temp_prob * precip_prob
+            
+            # Clean up legacy columns
+            legacy_columns = ['snowfall_probable', 'significant_albedo_increase', 
+                            'snowfall_validated']
+            adjusted_data = adjusted_data.drop(columns=legacy_columns, errors='ignore')
+            
+            # Add calculated probabilities (for analysis)
+            adjusted_data['temp_probability'] = temp_prob
+            adjusted_data['precip_probability'] = precip_prob
+            adjusted_data['snowfall_probability'] = snowfall_prob
+            
+            # *** CRITICAL: Calculate daily positive temperature and PDD ***
+            adjusted_data['daily_positive_temp'] = np.where(adjusted_data['TC'] > 0, 
+                                                          adjusted_data['TC'], 0)
+            adjusted_data['PDD'] = adjusted_data['daily_positive_temp'].cumsum()
+            
+            # Add metadata columns for better documentation
+            adjusted_data['station_elevation_m'] = self.station_elevations[station]
+            adjusted_data['processing_date'] = pd.Timestamp.now().strftime('%Y-%m-%d')
+            adjusted_data['model_version'] = 'temp-precip-v1.1'
+            
+            print(f"Calculated snowfall probabilities: mean = {snowfall_prob.mean():.3f}, "
+                  f"max = {snowfall_prob.max():.3f}")
+            print(f"Positive degree days (PDD): {adjusted_data['PDD'].iloc[-1]:.1f} (cumulative)")
+            print(f"Days with positive temperature: {(adjusted_data['daily_positive_temp'] > 0).sum()}")
+            
+            return adjusted_data
+            
+        except Exception as e:
+            print(f"Error processing {station} {year}: {str(e)}")
+            return None
+
+    def save_results_improved(self, processed_data, station, year):
+        """
+        Save results in multiple formats with proper documentation.
+        
+        Parameters:
+        processed_data (pd.DataFrame): Processed station data
+        station (str): Station identifier  
+        year (int): Year processed
+        """
+        output_dir = self.base_path / "processed_probability"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 1. Clean CSV file (no comment headers) - RECOMMENDED FORMAT
+        clean_csv_file = f"{station}_{year}_snowfall_probability_clean.csv"
+        clean_csv_path = output_dir / clean_csv_file
+        
+        processed_data.to_csv(clean_csv_path, index=False, float_format='%.6f')
+        print(f"    ✓ Clean CSV saved: {clean_csv_file}")
+        
+        # 2. Documented CSV with metadata in separate file
+        metadata_file = f"{station}_{year}_metadata.txt"
+        metadata_path = output_dir / metadata_file
+        
+        with open(metadata_path, 'w') as f:
+            f.write("SNOWFALL PROBABILITY ANALYSIS METADATA\n")
+            f.write("="*50 + "\n")
+            f.write(f"Station: {station}\n")
+            f.write(f"Elevation: {self.station_elevations[station]} m a.s.l.\n")
+            f.write(f"Year: {year}\n")
+            f.write(f"Processing date: {pd.Timestamp.now()}\n")
+            f.write(f"Method: Temperature-precipitation probability model\n")
+            f.write(f"Temperature model: P_temp = 1/(1 + exp(1.5*(T-1.0)))\n")
+            f.write(f"Precipitation model: Logarithmic scaling (0.1-5.0mm range)\n")
+            f.write(f"Orographic correction: +10% per 100m elevation\n")
+            f.write(f"Reference elevation: {self.hornsund_elevation} m (Hornsund)\n")
+            f.write(f"PDD calculation: Cumulative sum of daily positive temperatures\n")
+            f.write(f"Daily positive temp: max(0, daily_mean_temp)\n")
+            f.write(f"\nData summary:\n")
+            f.write(f"  Total records: {len(processed_data)}\n")
+            f.write(f"  Date range: {processed_data['date'].iloc[0]} to {processed_data['date'].iloc[-1]}\n")
+            f.write(f"  Mean snowfall probability: {processed_data['snowfall_probability'].mean():.4f}\n")
+            f.write(f"  High probability days (>0.5): {(processed_data['snowfall_probability'] > 0.5).sum()}\n")
+            f.write(f"  Very high probability days (>0.8): {(processed_data['snowfall_probability'] > 0.8).sum()}\n")
+            f.write(f"  Total PDD: {processed_data['PDD'].iloc[-1]:.1f}°C·days\n")
+            f.write(f"  Days with positive temperature: {(processed_data['daily_positive_temp'] > 0).sum()}\n")
+            f.write(f"  Mean daily positive temperature: {processed_data['daily_positive_temp'][processed_data['daily_positive_temp'] > 0].mean():.2f}°C\n")
+            f.write(f"\nColumns in CSV file:\n")
+            for i, col in enumerate(processed_data.columns, 1):
+                f.write(f"  {i:2d}. {col}\n")
+        
+        print(f"    ✓ Metadata saved: {metadata_file}")
+        
+        # 3. Summary statistics CSV
+        summary_file = f"{station}_{year}_summary.csv"
+        summary_path = output_dir / summary_file
+        
+        summary_stats = {
+            'station': [station],
+            'year': [year],
+            'elevation_m': [self.station_elevations[station]],
+            'total_days': [len(processed_data)],
+            'date_start': [processed_data['date'].iloc[0]],
+            'date_end': [processed_data['date'].iloc[-1]],
+            'mean_temperature': [processed_data['TC'].mean()],
+            'total_precipitation': [processed_data['precipitation'].sum()],
+            'mean_snowfall_prob': [processed_data['snowfall_probability'].mean()],
+            'max_snowfall_prob': [processed_data['snowfall_probability'].max()],
+            'high_prob_days': [(processed_data['snowfall_probability'] > 0.5).sum()],
+            'very_high_prob_days': [(processed_data['snowfall_probability'] > 0.8).sum()],
+            'total_PDD': [processed_data['PDD'].iloc[-1]],
+            'positive_temp_days': [(processed_data['daily_positive_temp'] > 0).sum()],
+            'mean_daily_positive_temp': [processed_data['daily_positive_temp'][processed_data['daily_positive_temp'] > 0].mean()],
+            'processing_date': [pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')]
+        }
+        
+        summary_df = pd.DataFrame(summary_stats)
+        summary_df.to_csv(summary_path, index=False)
+        print(f"    ✓ Summary saved: {summary_file}")
+    
+    def plot_station_analysis(self, data, station, year):
+        """
+        Generate comprehensive visualization of snowfall analysis results.
+        
+        Creates three plots:
+        1. Time series of temperature, snowfall probability, and albedo
+        2. Temperature-precipitation scatter plot colored by snowfall probability
+        3. Model validation: snowfall probability vs. observed albedo
+        
+        Parameters:
+        data (pd.DataFrame): Processed station data
+        station (str): Station name for plot titles
+        year (int): Year for plot titles
+        """
+        # Main figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+        fig.suptitle(f'Snowfall Probability Analysis: {station.upper()} Station ({year})', 
+                    fontsize=16, fontweight='bold')
+        
+        # Plot 1: Multi-variable time series
+        color_temp = 'darkgreen'
+        ax1.plot(data['day_of_year'], data['TC'], color=color_temp, 
+                linewidth=1.5, label='Air Temperature', alpha=0.8)
+        ax1.set_xlabel('Day of Year')
+        ax1.set_ylabel('Temperature (°C)', color=color_temp, fontweight='bold')
+        ax1.tick_params(axis='y', labelcolor=color_temp)
+        ax1.grid(True, alpha=0.3)
+        
+        # Secondary axis: Snowfall probability
+        ax1_prob = ax1.twinx()
+        color_prob = 'darkblue'
+        ax1_prob.plot(data['day_of_year'], data['snowfall_probability'], 
+                     color=color_prob, linewidth=2, label='Snowfall Probability', alpha=0.9)
+        ax1_prob.set_ylabel('Snowfall Probability', color=color_prob, fontweight='bold')
+        ax1_prob.tick_params(axis='y', labelcolor=color_prob)
+        ax1_prob.set_ylim(0, 1)
+        
+        # Tertiary axis: Albedo
+        ax1_albedo = ax1.twinx()
+        ax1_albedo.spines["right"].set_position(("axes", 1.08))
+        color_albedo = 'darkred'
+        ax1_albedo.plot(data['day_of_year'], data['albedo'], color=color_albedo,
+                       linewidth=1, label='Surface Albedo', alpha=0.7, linestyle='--')
+        ax1_albedo.set_ylabel('Albedo', color=color_albedo, fontweight='bold')
+        ax1_albedo.tick_params(axis='y', labelcolor=color_albedo)
+        ax1_albedo.set_ylim(0, 1)
+        
+        # Combine legends
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1_prob.get_legend_handles_labels()
+        lines3, labels3 = ax1_albedo.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, 
+                  loc='upper right', bbox_to_anchor=(0.85, 1))
+        
+        # Plot 2: Temperature-Precipitation phase space
+        scatter = ax2.scatter(data['TC'], data['precipitation'], 
+                            c=data['snowfall_probability'],
+                            cmap='RdYlBu_r', alpha=0.7, s=30)
+        
+        # Add colorbar
+        cbar = plt.colorbar(scatter, ax=ax2, label='Snowfall Probability')
+        cbar.set_label('Snowfall Probability', fontweight='bold')
+        
+        # Overlay albedo information as point sizes
+        sizes = 10 + data['albedo'] * 80
+        ax2.scatter(data['TC'], data['precipitation'], s=sizes, 
+                   facecolors='none', edgecolors='red', alpha=0.3, linewidth=0.5,
+                   label='Albedo (point size)')
+        
+        ax2.set_xlabel('Air Temperature (°C)', fontweight='bold')
+        ax2.set_ylabel('Precipitation (mm)', fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper right')
+        
+        # Reference lines
+        ax2.axvline(x=0, color='gray', linestyle='--', alpha=0.5, label='Freezing point')
+        ax2.axvline(x=2, color='orange', linestyle='--', alpha=0.5, label='Snowfall threshold')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Plot 3: Model validation
+        plt.figure(figsize=(10, 7))
+        
+        # Scatter plot colored by temperature
+        validation_scatter = plt.scatter(data['snowfall_probability'], data['albedo'], 
+                                       c=data['TC'], cmap='coolwarm', alpha=0.6, s=40)
+        
+        cbar_val = plt.colorbar(validation_scatter, label='Air Temperature (°C)')
+        cbar_val.set_label('Air Temperature (°C)', fontweight='bold')
+        
+        plt.xlabel('Calculated Snowfall Probability', fontweight='bold')
+        plt.ylabel('Observed Surface Albedo', fontweight='bold')
+        plt.title(f'Model Validation: Snowfall Probability vs. Albedo\n'
+                 f'{station.upper()} Station ({year})', fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        
+        # Add correlation
+        correlation = np.corrcoef(data['snowfall_probability'], data['albedo'])[0, 1]
+        plt.text(0.05, 0.95, f'Correlation: r = {correlation:.3f}', 
+                transform=plt.gca().transAxes, fontsize=12, 
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print summary statistics
+        print(f"\n{'='*50}")
+        print(f"ANALYSIS SUMMARY: {station.upper()} {year}")
+        print(f"{'='*50}")
+        print(f"Total observations: {len(data)}")
+        print(f"Mean snowfall probability: {data['snowfall_probability'].mean():.3f}")
+        print(f"High probability days (>0.5): {(data['snowfall_probability'] > 0.5).sum()}")
+        print(f"Very high probability days (>0.8): {(data['snowfall_probability'] > 0.8).sum()}")
+        print(f"Temperature range: {data['TC'].min():.1f}°C to {data['TC'].max():.1f}°C")
+        print(f"Total precipitation: {data['precipitation'].sum():.1f} mm")
+        print(f"Total PDD: {data['PDD'].iloc[-1]:.1f}°C·days")
+        print(f"Days with positive temperature: {(data['daily_positive_temp'] > 0).sum()}")
+        print(f"Mean daily positive temperature: {data['daily_positive_temp'][data['daily_positive_temp'] > 0].mean():.2f}°C")
+        print(f"Probability-Albedo correlation: {correlation:.3f}")
+
+def main():
+    """
+    Main execution function for batch processing of all stations and years.
+    
+    Processes meteorological data for each station-year combination,
+    calculates snowfall probabilities, and generates visualizations.
+    """
+    
+    # Configuration - UPDATE THIS PATH TO YOUR DATA DIRECTORY
+    base_path = Path(r"C:\Users\PC\PhD\2024_Hans_data\Albedo_Glacier_ML\processed_data\daily_ready")
+    
+    print("="*60)
+    print("SVALBARD GLACIER SNOWFALL PROBABILITY ANALYSIS")
+    print("="*60)
+    print(f"Data directory: {base_path}")
+    print(f"Processing started at: {pd.Timestamp.now()}")
+    
+    # Initialize analyzer
+    analyzer = SnowfallAnalyzer(base_path)
+    
+    # Define stations and years for analysis
+    stations_years = {
+        'hans4': [2010, 2011],        # Hansbreen lower elevation
+        'hans9': [2010, 2011],        # Hansbreen higher elevation  
+        'werenskiold': [2011, 2012]   # Werenskiöldbreen
+    }
+    
+    # Batch processing
+    successful_processing = 0
+    total_combinations = sum(len(years) for years in stations_years.values())
+    
+    for station, years in stations_years.items():
+        print(f"\n{'-'*40}")
+        print(f"PROCESSING STATION: {station.upper()}")
+        print(f"Elevation: {analyzer.station_elevations[station]} m a.s.l.")
+        print(f"{'-'*40}")
+        
+        for year in years:
+            print(f"\n  → Processing year {year}...")
+            
+            # Process station data
+            processed_data = analyzer.process_station_data(station, year)
+            
+            if processed_data is not None:
+                # Save results using improved method
+                analyzer.save_results_improved(processed_data, station, year)
+                
+                # Generate visualizations
+                print(f"    → Generating plots...")
+                analyzer.plot_station_analysis(processed_data, station, year)
+                
+                successful_processing += 1
+                
+            else:
+                print(f"    ✗ Failed to process {station} {year}")
+    
+    # Final summary
+    print(f"\n{'='*60}")
+    print("PROCESSING COMPLETE")
+    print(f"{'='*60}")
+    print(f"Successfully processed: {successful_processing}/{total_combinations} station-year combinations")
+    print(f"Output directory: {base_path / 'processed_probability'}")
+    print(f"Files generated per station-year:")
+    print(f"  • *_snowfall_probability_clean.csv (main data - CSV compatible)")
+    print(f"  • *_metadata.txt (documentation)")
+    print(f"  • *_summary.csv (key statistics)")
+    print(f"Completion time: {pd.Timestamp.now()}")
+
+# Execute the main analysis
+if __name__ == "__main__":
+    main()
