@@ -1,0 +1,201 @@
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+import os
+
+def load_and_analyze_albedo(filepath, glacier_name, date):
+    """
+    Load albedo data from .tif file and calculate statistics
+    
+    Parameters:
+    filepath (str): Path to the .tif file
+    glacier_name (str): Name of the glacier
+    date (str): Date of the measurement
+    
+    Returns:
+    tuple: (albedo_data, mean_albedo, valid_pixel_count, valid_mask)
+    """
+    try:
+        with rasterio.open(filepath) as src:
+            # Read the first band containing albedo values
+            albedo_data = src.read(1)
+            
+            # Get NoData value from the raster metadata
+            nodata_value = src.nodata
+            
+            # Create mask to identify valid pixels (exclude NoData and invalid albedo values)
+            if nodata_value is not None:
+                valid_mask = albedo_data != nodata_value
+            else:
+                # Fallback: exclude NaN and values outside valid albedo range (0-1)
+                valid_mask = (~np.isnan(albedo_data)) & (albedo_data >= 0) & (albedo_data <= 1)
+            
+            # Calculate statistics using only valid pixels
+            valid_albedo = albedo_data[valid_mask]
+            
+            if len(valid_albedo) > 0:
+                mean_albedo = np.mean(valid_albedo)
+                valid_pixel_count = len(valid_albedo)
+            else:
+                # Handle case where no valid pixels exist
+                mean_albedo = np.nan
+                valid_pixel_count = 0
+                
+            return albedo_data, mean_albedo, valid_pixel_count, valid_mask
+            
+    except Exception as e:
+        print(f"Error loading {filepath}: {str(e)}")
+        return None, None, None, None
+
+def visualize_albedo(albedo_data, valid_mask, glacier_name, date, mean_albedo):
+    """
+    Create visualization of albedo data with custom colormap
+    
+    Parameters:
+    albedo_data (numpy.ndarray): Albedo data array
+    valid_mask (numpy.ndarray): Boolean mask for valid pixels
+    glacier_name (str): Name of the glacier
+    date (str): Date of the measurement
+    mean_albedo (float): Mean albedo value
+    """
+    # Create custom colormap: dark blue (low albedo) to white (high albedo)
+    colors = ['#08306b', '#2171b5', '#6baed6', '#c6dbef', '#ffffff']
+    n_bins = 100
+    cmap = LinearSegmentedColormap.from_list('albedo', colors, N=n_bins)
+    
+    # Set up the plot
+    plt.figure(figsize=(12, 8))
+    
+    # Mask invalid pixels for proper visualization
+    masked_albedo = np.ma.masked_where(~valid_mask, albedo_data)
+    
+    # Display albedo map with standardized scale (0-1)
+    im = plt.imshow(masked_albedo, cmap=cmap, vmin=0, vmax=1)
+    
+    # Add colorbar with label
+    cbar = plt.colorbar(im, shrink=0.8)
+    cbar.set_label('Albedo', rotation=270, labelpad=20, fontsize=12)
+    
+    # Add title with glacier name, date, and mean albedo
+    plt.title(f'{glacier_name} - Albedo Distribution\nDate: {date} | Mean Albedo: {mean_albedo:.2f}', 
+              fontsize=14, fontweight='bold')
+    plt.xlabel('Pixel X', fontsize=12)
+    plt.ylabel('Pixel Y', fontsize=12)
+    
+    # Remove axis ticks for cleaner appearance
+    plt.xticks([])
+    plt.yticks([])
+    
+    plt.tight_layout()
+    plt.show()
+
+def main():
+    """
+    Main function to process all glacier albedo files and generate analysis
+    """
+    # Define file paths and metadata for Svalbard glaciers (2011 summer season)
+    files_data = [
+        {
+            'filepath': r"D:\PhD\1st_year\1st_article\Landsat_images\15-08-2011\LE72110052011207ASN00_2011-07-26\Calculated\Werenskiold_02_albedo_26_07_2011.tif",
+            'glacier': 'Werenskioldbreen',
+            'date': '26.07.2011'
+        },
+        {
+            'filepath': r"D:\PhD\1st_year\1st_article\Landsat_images\15-08-2011\LE72100052011232ASN00_2011-08-20\Calculated\Werenskiold_02_albedo_20_08_2011.tif",
+            'glacier': 'Werenskioldbreen',
+            'date': '20.08.2011'
+        },
+        {
+            'filepath': r"D:\PhD\1st_year\1st_article\Landsat_images\15-08-2011\LE72110052011207ASN00_2011-07-26\Calculated\Hans_02_albedo_26_07_2011.tif",
+            'glacier': 'Hansbreen',
+            'date': '26.07.2011'
+        },
+        {
+            'filepath': r"D:\PhD\1st_year\1st_article\Landsat_images\15-08-2011\LE72100052011232ASN00_2011-08-20\Calculated\Hans_02_albedo_20_08_2011.tif",
+            'glacier': 'Hansbreen',  
+            'date': '20.08.2011'
+        }
+    ]
+    
+    print("=== Svalbard Glacier Albedo Analysis ===\n")
+    
+    # Initialize results storage
+    results = []
+    
+    # Process each albedo file
+    for file_info in files_data:
+        filepath = file_info['filepath']
+        glacier_name = file_info['glacier']
+        date = file_info['date']
+        
+        print(f"Processing: {glacier_name} - {date}")
+        print(f"File: {os.path.basename(filepath)}")
+        
+        # Check file existence before processing
+        if not os.path.exists(filepath):
+            print(f"⚠️  File not found: {filepath}")
+            print("-" * 60)
+            continue
+        
+        # Load and analyze albedo data
+        albedo_data, mean_albedo, valid_pixel_count, valid_mask = load_and_analyze_albedo(
+            filepath, glacier_name, date
+        )
+        
+        if albedo_data is not None:
+            # Display processing results
+            print(f"✅ Successfully loaded albedo data")
+            print(f"   Mean Albedo: {mean_albedo:.4f}")
+            print(f"   Valid pixels: {valid_pixel_count:,}")
+            print(f"   Total pixels: {albedo_data.size:,}")
+            print(f"   Data coverage: {(valid_pixel_count/albedo_data.size)*100:.1f}%")
+            
+            # Store results for summary analysis
+            results.append({
+                'glacier': glacier_name,
+                'date': date,
+                'mean_albedo': mean_albedo,
+                'valid_pixels': valid_pixel_count
+            })
+            
+            # Generate visualization
+            visualize_albedo(albedo_data, valid_mask, glacier_name, date, mean_albedo)
+            
+        else:
+            print("❌ Failed to load data")
+        
+        print("-" * 60)
+    
+    # Generate summary statistics table
+    if results:
+        print("\n=== SUMMARY TABLE ===")
+        print(f"{'Glacier':<20} {'Date':<12} {'Mean Albedo':<12} {'Valid Pixels':<12}")
+        print("=" * 60)
+        
+        for result in results:
+            print(f"{result['glacier']:<20} {result['date']:<12} {result['mean_albedo']:<12.4f} {result['valid_pixels']:<12,}")
+        
+        # Calculate temporal changes between July and August
+        print("\n=== TEMPORAL CHANGES ===")
+        werenskiold_data = [r for r in results if r['glacier'] == 'Werenskioldbreen']
+        hansbreen_data = [r for r in results if r['glacier'] == 'Hansbreen']
+        
+        # Werenskioldbreen temporal change
+        if len(werenskiold_data) == 2:
+            july_w = next((r for r in werenskiold_data if '26.07' in r['date']), None)
+            august_w = next((r for r in werenskiold_data if '20.08' in r['date']), None)
+            if july_w and august_w:
+                change_w = august_w['mean_albedo'] - july_w['mean_albedo']
+                print(f"Werenskioldbreen: {change_w:+.4f} (July to August)")
+        
+        # Hansbreen temporal change
+        if len(hansbreen_data) == 2:
+            july_h = next((r for r in hansbreen_data if '26.07' in r['date']), None)
+            august_h = next((r for r in hansbreen_data if '20.08' in r['date']), None)
+            if july_h and august_h:
+                change_h = august_h['mean_albedo'] - july_h['mean_albedo']
+                print(f"Hansbreen: {change_h:+.4f} (July to August)")
+
+if __name__ == "__main__":
+    main()
