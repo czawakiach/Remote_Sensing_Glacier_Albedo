@@ -1,0 +1,366 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.impute import SimpleImputer
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+
+def standardize_station_names(df):
+    """
+    Standardize station names to AWS_H4, AWS_H9, AWS_WRN format
+    """
+    station_mapping = {
+        'hans4': 'AWS_H4',
+        'hans9': 'AWS_H9',
+        'werenskiold': 'AWS_WRN',
+        'werenskioldbreen': 'AWS_WRN'
+    }
+    
+    if 'station' in df.columns:
+        df['station'] = df['station'].map(lambda x: station_mapping.get(x.lower(), x))
+    
+    return df
+
+def load_and_combine_data(base_path, train_files, test_files):
+    """
+    Load and combine data separately for training and testing sets
+    """
+    base_dir = Path(base_path)
+    
+    # Load training data
+    train_dfs = []
+    for file_name in train_files:
+        file_path = base_dir / file_name
+        df = pd.read_csv(file_path)
+        df = standardize_station_names(df)
+        print(f"Loaded training: {file_name} ({len(df)} records)")
+        train_dfs.append(df)
+    
+    # Load testing data
+    test_dfs = []
+    for file_name in test_files:
+        file_path = base_dir / file_name
+        df = pd.read_csv(file_path)
+        df = standardize_station_names(df)
+        print(f"Loaded testing: {file_name} ({len(df)} records)")
+        test_dfs.append(df)
+    
+    return pd.concat(train_dfs, ignore_index=True), pd.concat(test_dfs, ignore_index=True)
+
+def filter_season(df, year_col='year', doy_col='day_of_year'):
+    """
+    Filter dataframe to keep data from April 8th to September 4th
+    """
+    spring_start_doy = 98   # April 8th
+    end_date_doy = 247      # September 4th
+    
+    season_mask = (df[doy_col] >= spring_start_doy) & (df[doy_col] <= end_date_doy)
+    return df[season_mask].copy()
+
+def prepare_data(base_path, train_files, test_files):
+    """
+    Load and prepare data for training (2010 hans4/hans9, 2012 werenskiold) 
+    and testing (2011 all stations)
+    """
+    # Load and combine training and testing data separately
+    train_df, test_df = load_and_combine_data(base_path, train_files, test_files)
+    
+    # Filter for extended season
+    train_df = filter_season(train_df)
+    test_df = filter_season(test_df)
+    
+    # Define feature columns
+    feature_cols = ['day_of_year', 'daily_positive_temp', 'PDD', 'snowfall_probability']
+    
+    print(f"\nUsing features: {feature_cols}")
+    
+    # Check if columns exist
+    missing_train = [col for col in feature_cols + ['albedo'] if col not in train_df.columns]
+    missing_test = [col for col in feature_cols + ['albedo'] if col not in test_df.columns]
+    
+    if missing_train:
+        print(f"Warning: Missing columns in training data: {missing_train}")
+        print(f"Available columns: {list(train_df.columns)}")
+    
+    if missing_test:
+        print(f"Warning: Missing columns in test data: {missing_test}")
+        print(f"Available columns: {list(test_df.columns)}")
+    
+    # Prepare training data
+    X_train = train_df[feature_cols]
+    y_train = train_df['albedo']
+    
+    # Prepare testing data
+    X_test = test_df[feature_cols]
+    y_test = test_df['albedo']
+    
+    # Handle missing values in features
+    feature_imputer = SimpleImputer(strategy='mean')
+    X_train_clean = pd.DataFrame(
+        feature_imputer.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index
+    )
+    X_test_clean = pd.DataFrame(
+        feature_imputer.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index
+    )
+    
+    # Handle missing values in target
+    target_imputer = SimpleImputer(strategy='mean')
+    y_train_clean = pd.Series(
+        target_imputer.fit_transform(y_train.values.reshape(-1, 1)).ravel(),
+        index=y_train.index
+    )
+    y_test_clean = pd.Series(
+        target_imputer.transform(y_test.values.reshape(-1, 1)).ravel(),
+        index=y_test.index
+    )
+    
+    # Print information about missing values
+    print("\nMissing values summary before imputation:")
+    print("\nFeatures (X_train):")
+    print(X_train.isna().sum())
+    print("\nTarget (y_train):")
+    print(f"Missing values in y_train: {y_train.isna().sum()}")
+    
+    print(f"\nData summary:")
+    print(f"Training samples: {len(X_train_clean)}")
+    print(f"Testing samples: {len(X_test_clean)}")
+    
+    return X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_df
+
+def calculate_prediction_intervals(model, X, confidence=0.95):
+    """
+    Calculate prediction intervals for linear regression
+    Returns standard error for creating confidence bands
+    """
+    # Get predictions
+    y_pred = model.predict(X)
+    
+    # Calculate residual standard error
+    # Note: This is a simplified approach. For more accurate intervals,
+    # you would need the training data residuals
+    return y_pred
+
+def train_and_evaluate_model(X_train, X_test, y_train, y_test, test_data):
+    """
+    Train linear regression model and evaluate performance
+    """
+    # Train model
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+    
+    # Make predictions
+    y_pred = model.predict(X_test)
+    
+    # Calculate residuals for uncertainty estimation
+    y_train_pred = model.predict(X_train)
+    train_residuals = y_train - y_train_pred
+    residual_std = np.std(train_residuals)
+    
+    # Calculate overall metrics
+    r2 = r2_score(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    
+    # Calculate station-specific metrics
+    station_metrics = {}
+    for station in test_data['station'].unique():
+        mask = test_data['station'] == station
+        station_y_test = y_test[mask]
+        station_y_pred = y_pred[mask]
+        
+        station_metrics[station] = {
+            'R2': r2_score(station_y_test, station_y_pred),
+            'RMSE': np.sqrt(mean_squared_error(station_y_test, station_y_pred))
+        }
+    
+    # Get feature importance
+    feature_importance = dict(zip(X_train.columns, model.coef_))
+    
+    # Add normalized feature importance
+    abs_coefficients = np.abs(model.coef_)
+    normalized_importance = abs_coefficients / np.sum(abs_coefficients)
+    normalized_importance = dict(zip(X_train.columns, normalized_importance))
+    
+    return model, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance, residual_std
+
+def plot_predicted_vs_measured(y_test, y_pred, test_data, rmse):
+    """
+    Create scatter plot of predicted vs measured albedo values with error information
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Define colors for stations
+    station_colors = {
+        'AWS_H4': '#1f77b4',
+        'AWS_H9': '#ff7f0e', 
+        'AWS_WRN': '#2ca02c'
+    }
+    
+    # Plot by station
+    for station in sorted(test_data['station'].unique()):
+        mask = test_data['station'] == station
+        color = station_colors.get(station, None)
+        plt.scatter(y_test[mask], y_pred[mask], alpha=0.6, label=station, 
+                   s=50, color=color, edgecolors='white', linewidth=0.5)
+    
+    # Add perfect prediction line
+    line = np.linspace(min(y_test), max(y_test), 100)
+    plt.plot(line, line, 'k--', alpha=0.5, linewidth=2, label='1:1 line')
+    
+    # Add RMSE as shaded region around 1:1 line
+    plt.fill_between(line, line - rmse, line + rmse, alpha=0.2, color='gray', 
+                     label=f'±RMSE ({rmse:.2f})')
+    
+    plt.xlabel('Measured Albedo', fontsize=12, fontweight='bold')
+    plt.ylabel('Predicted Albedo', fontsize=12, fontweight='bold')
+    plt.title('Linear Regression: Predicted vs Measured Albedo (2011 Test Data)\nTemperature Dominated Model', 
+              fontsize=14, fontweight='bold')
+    plt.legend(fontsize=10, loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_feature_importance(feature_importance):
+    """
+    Create bar plot of feature importance
+    """
+    plt.figure(figsize=(10, 6))
+    importance_df = pd.DataFrame({
+        'Feature': feature_importance.keys(),
+        'Coefficient': feature_importance.values()
+    })
+    importance_df = importance_df.sort_values('Coefficient', key=abs, ascending=True)
+    
+    plt.barh(importance_df['Feature'], importance_df['Coefficient'])
+    plt.xlabel('Coefficient Value', fontsize=12, fontweight='bold')
+    plt.title('Linear Regression Feature Coefficients', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_station_time_series(station_name, test_data, y_test, y_pred, residual_std):
+    """
+    Plot time series comparison for a specific station with uncertainty bands
+    """
+    mask = test_data['station'] == station_name
+    
+    station_data = test_data[mask]
+    station_measured = y_test[mask]
+    station_predicted = y_pred[mask]
+    
+    plt.figure(figsize=(14, 7))
+    
+    # Sort by day of year
+    sort_idx = np.argsort(station_data['day_of_year'])
+    days = station_data['day_of_year'].values[sort_idx]
+    measured = station_measured.values[sort_idx]
+    predicted = station_predicted[sort_idx]
+    
+    # Calculate uncertainty bounds (±1 standard deviation of residuals)
+    upper_bound = predicted + residual_std
+    lower_bound = predicted - residual_std
+    
+    # Plot uncertainty band first (so it's in the background)
+    plt.fill_between(days, lower_bound, upper_bound, 
+                     alpha=0.3, color='gray', 
+                     label=f'Uncertainty band (±{residual_std:.2f})')
+    
+    # Plot the lines
+    plt.plot(days, measured, 'b-', label='Measured', linewidth=2.5, marker='o', 
+             markersize=4, markevery=5)
+    plt.plot(days, predicted, 'r--', label='Predicted', linewidth=2.5, marker='s', 
+             markersize=4, markevery=5)
+    
+    plt.xlabel('Day of Year', fontsize=12, fontweight='bold')
+    plt.ylabel('Albedo', fontsize=12, fontweight='bold')
+    plt.title(f'Albedo Time Series for {station_name} (2011)\nTemperature Dominated Model', 
+              fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11, loc='best')
+    plt.grid(True, alpha=0.3)
+    plt.ylim([0, 1])
+    plt.tight_layout()
+    plt.show()
+
+def main():
+    print("="*60)
+    print("TEMPERATURE-DOMINATED ALBEDO PREDICTION MODEL")
+    print("="*60)
+    
+    # Configuration - UPDATE THIS PATH
+    base_path = r"C:\Users\PC\PhD\2024_Hans_data\Albedo_Glacier_ML\processed_data\daily_ready\processed_probability"
+    
+    # Define training and testing file paths
+    train_files = [
+        "hans4_2010_snowfall_probability_clean.csv",
+        "hans9_2010_snowfall_probability_clean.csv",
+        "werenskiold_2012_snowfall_probability_clean.csv",
+    ]
+    
+    test_files = [
+        "hans4_2011_snowfall_probability_clean.csv",
+        "werenskiold_2011_snowfall_probability_clean.csv"
+    ]
+    
+    print(f"Base path: {base_path}")
+    print(f"Training files: {train_files}")
+    print(f"Testing files: {test_files}")
+    
+    # Load and prepare data
+    X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean = prepare_data(
+        base_path, train_files, test_files
+    )
+    
+    # Train and evaluate model
+    model, y_pred, r2, rmse, station_metrics, feature_importance, normalized_importance, residual_std = train_and_evaluate_model(
+        X_train_clean, X_test_clean, y_train_clean, y_test_clean, test_data_clean
+    )
+    
+    # Print results
+    print("\nExtended Season Linear Regression Results (April 8 - September 4)")
+    print("-" * 50)
+    print(f"Overall Model Performance:")
+    print(f"R² Score: {r2:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"Residual Std Dev: {residual_std:.2f}")
+    print("\nStation-specific Performance:")
+    for station in sorted(station_metrics.keys()):
+        metrics = station_metrics[station]
+        print(f"\n{station}:")
+        print(f"  R² Score: {metrics['R2']:.2f}")
+        print(f"  RMSE: {metrics['RMSE']:.2f}")
+    print("\nFeature Importance:")
+    for feature in feature_importance:
+        print(f"{feature}:")
+        print(f"  Coefficient: {feature_importance[feature]:.2f}")
+        print(f"  Normalized Importance: {normalized_importance[feature]:.2f}")
+    
+    # Analyze thermal vs precipitation dominance
+    thermal_features = ['daily_positive_temp', 'PDD']
+    thermal_importance = sum(normalized_importance.get(f, 0) for f in thermal_features)
+    precip_importance = normalized_importance.get('snowfall_probability', 0)
+    
+    print(f"\nProcess Dominance Analysis:")
+    print(f"Thermal processes: {thermal_importance:.1%}")
+    print(f"Precipitation processes: {precip_importance:.1%}")
+    
+    if thermal_importance > precip_importance:
+        print("→ THERMAL DOMINANCE confirmed")
+    else:
+        print("→ PRECIPITATION DOMINANCE detected")
+    
+    # Create plots
+    plot_predicted_vs_measured(y_test_clean, y_pred, test_data_clean, rmse)
+    plot_feature_importance(feature_importance)
+    
+    # Create individual station time series plots with uncertainty bands
+    for station in sorted(test_data_clean['station'].unique()):
+        plot_station_time_series(station, test_data_clean, y_test_clean, y_pred, residual_std)
+
+if __name__ == "__main__":
+    main()
