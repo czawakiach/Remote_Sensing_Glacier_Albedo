@@ -1,0 +1,733 @@
+"""
+Multi-Albedo Analysis for Hansbreen and Werenskioldbreen Glaciers
+Using Google Earth Engine and Landsat 7 ETM+ Surface Reflectance
+
+Author: Dominik Cyran
+Date: 2025
+PhD Research: Glacier albedo temporal analysis
+
+Algorithms implemented:
+1. Liang (2001) - Narrowband to broadband conversion
+2. Tasumi et al. (2008) - METRIC approach
+3. Silva et al. (2016) - Adapted for Landsat
+4. Simple visible-NIR - Basic approach
+5. Knap et al. (1999) - Glacier-specific algorithm
+"""
+
+import ee
+import geemap
+import json
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# Initialize Earth Engine
+try:
+    ee.Initialize()
+    print("✓ Earth Engine initialized successfully")
+except Exception as e:
+    print(f"Initializing Earth Engine...")
+    ee.Authenticate()
+    ee.Initialize()
+    print("✓ Earth Engine initialized successfully")
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+# File paths - update these to your local paths
+HANSBREEN_PATH = r"D:\PhD\3rd_year\1st_article\Shapefiles_geojson\Hansbreen_WGS84.geojson"
+WERENSKIOLDBREEN_PATH = r"D:\PhD\3rd_year\1st_article\Shapefiles_geojson\Werenskioldbreen_WGS84.geojson"
+COMBINED_PATH = r"D:\PhD\3rd_year\1st_article\Shapefiles_geojson\Combined_Glaciers_WGS84.geojson"
+
+# Target dates
+TARGET_DATES = ['2011-07-26', '2011-08-20']
+
+# Output settings
+OUTPUT_DIR = r"D:\PhD\3rd_year\1st_article\Results"
+EXPORT_MAPS = True  # Set to True if you want to export GeoTIFF maps
+
+# ==============================================================================
+# LOAD GLACIER BOUNDARIES
+# ==============================================================================
+
+def load_geojson_to_ee(filepath, name):
+    """Load GeoJSON and convert to Earth Engine Feature Collection"""
+    with open(filepath, 'r') as f:
+        geojson_data = json.load(f)
+    
+    def remove_z_coordinate(geometry):
+        """Remove Z coordinate (elevation) from geometry for GEE compatibility"""
+        if geometry['type'] == 'Polygon':
+            # Polygon has one array of coordinate rings
+            new_coords = []
+            for ring in geometry['coordinates']:
+                new_ring = [[coord[0], coord[1]] for coord in ring]
+                new_coords.append(new_ring)
+            return {'type': 'Polygon', 'coordinates': new_coords}
+        elif geometry['type'] == 'MultiPolygon':
+            # MultiPolygon has multiple polygons
+            new_coords = []
+            for polygon in geometry['coordinates']:
+                new_polygon = []
+                for ring in polygon:
+                    new_ring = [[coord[0], coord[1]] for coord in ring]
+                    new_polygon.append(new_ring)
+                new_coords.append(new_polygon)
+            return {'type': 'MultiPolygon', 'coordinates': new_coords}
+        else:
+            return geometry
+    
+    # Convert to EE FeatureCollection
+    features = []
+    for feature in geojson_data['features']:
+        # Remove Z coordinate from geometry
+        geometry_2d = remove_z_coordinate(feature['geometry'])
+        
+        ee_feature = ee.Feature(
+            ee.Geometry(geometry_2d),
+            feature['properties']
+        )
+        features.append(ee_feature)
+    
+    fc = ee.FeatureCollection(features)
+    print(f"✓ Loaded {name}: {len(geojson_data['features'])} feature(s)")
+    
+    return fc
+
+print("\n" + "="*70)
+print("LOADING GLACIER BOUNDARIES")
+print("="*70)
+
+hansbreen = load_geojson_to_ee(HANSBREEN_PATH, "Hansbreen")
+werenskioldbreen = load_geojson_to_ee(WERENSKIOLDBREEN_PATH, "Werenskioldbreen")
+combined_glaciers = load_geojson_to_ee(COMBINED_PATH, "Combined Glaciers")
+
+# Get glacier areas
+hansbreen_area = hansbreen.geometry().area().divide(1e6).getInfo()
+werenskioldbreen_area = werenskioldbreen.geometry().area().divide(1e6).getInfo()
+combined_area = combined_glaciers.geometry().area().divide(1e6).getInfo()
+
+print(f"\nGlacier Areas:")
+print(f"  Hansbreen: {hansbreen_area:.2f} km²")
+print(f"  Werenskioldbreen: {werenskioldbreen_area:.2f} km²")
+print(f"  Combined: {combined_area:.2f} km²")
+
+# ==============================================================================
+# LANDSAT 7 DATA PREPARATION
+# ==============================================================================
+
+def apply_scale_factors(image):
+    """
+    Apply scale factors to Landsat Collection 2 Surface Reflectance
+    Scale factor: 0.0000275
+    Offset: -0.2
+    """
+    optical_bands = image.select('SR_B.').multiply(0.0000275).add(-0.2)
+    thermal_band = image.select('ST_B6').multiply(0.00341802).add(149.0)
+    
+    return image.addBands(optical_bands, None, True).addBands(thermal_band, None, True)
+
+def mask_clouds_and_quality(image):
+    """
+    Mask clouds, cloud shadows, and snow using QA_PIXEL band
+    For glaciers, we DON'T want to mask snow, but DO want to mask clouds
+    """
+    qa = image.select('QA_PIXEL')
+    
+    # Bits for masking
+    # Bit 3: Cloud
+    # Bit 4: Cloud Shadow
+    cloud_bit = 1 << 3
+    cloud_shadow_bit = 1 << 4
+    
+    # Create mask (0 = mask, 1 = keep)
+    mask = qa.bitwiseAnd(cloud_bit).eq(0).And(
+           qa.bitwiseAnd(cloud_shadow_bit).eq(0))
+    
+    return image.updateMask(mask)
+
+print("\n" + "="*70)
+print("RETRIEVING LANDSAT 7 IMAGES")
+print("="*70)
+
+# Get Landsat 7 Surface Reflectance collection
+collection = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2') \
+    .filterBounds(combined_glaciers.geometry()) \
+    .filter(ee.Filter.inList('DATE_ACQUIRED', TARGET_DATES)) \
+    .map(mask_clouds_and_quality) \
+    .map(apply_scale_factors)
+
+# Get image information
+all_images = collection.getInfo()
+image_count = len(all_images['features'])
+
+print(f"\nRetrieved {image_count} Landsat 7 images")
+
+# Display image information
+image_metadata = []
+for i, img in enumerate(all_images['features']):
+    props = img['properties']
+    date = props['DATE_ACQUIRED']
+    scene_id = props['LANDSAT_SCENE_ID']
+    cloud_cover = props.get('CLOUD_COVER', 'N/A')
+    sun_elevation = props.get('SUN_ELEVATION', 'N/A')
+    
+    image_metadata.append({
+        'date': date,
+        'scene_id': scene_id,
+        'cloud_cover': cloud_cover,
+        'sun_elevation': sun_elevation
+    })
+    
+    print(f"\n  Image {i+1}:")
+    print(f"    Date: {date}")
+    print(f"    Scene ID: {scene_id}")
+    print(f"    Cloud cover: {cloud_cover}%")
+    print(f"    Sun elevation: {sun_elevation}°")
+
+# ==============================================================================
+# ALBEDO ALGORITHMS
+# ==============================================================================
+
+def calculate_liang_2001_albedo(image):
+    """
+    Liang (2001) - Narrowband to broadband albedo conversion for Landsat 7 ETM+
+    
+    Reference: Liang, S. (2001). Narrowband to broadband conversions of land 
+    surface albedo I: Algorithms. Remote Sensing of Environment, 76(2), 213-238.
+    
+    Formula for Landsat 7:
+    α = 0.356*ρ1 + 0.130*ρ3 + 0.373*ρ4 + 0.085*ρ5 + 0.072*ρ7 - 0.0018
+    
+    Where ρ is surface reflectance
+    """
+    blue = image.select('SR_B1')    # Band 1: 0.45-0.52 μm
+    green = image.select('SR_B2')   # Band 2: 0.52-0.60 μm
+    red = image.select('SR_B3')     # Band 3: 0.63-0.69 μm
+    nir = image.select('SR_B4')     # Band 4: 0.77-0.90 μm
+    swir1 = image.select('SR_B5')   # Band 5: 1.55-1.75 μm
+    swir2 = image.select('SR_B7')   # Band 7: 2.09-2.35 μm
+    
+    albedo = blue.multiply(0.356).add(
+             red.multiply(0.130)).add(
+             nir.multiply(0.373)).add(
+             swir1.multiply(0.085)).add(
+             swir2.multiply(0.072)).subtract(0.0018)
+    
+    # Clamp values between 0 and 1
+    albedo = albedo.clamp(0, 1)
+    
+    return albedo.rename('albedo_liang2001')
+
+def calculate_tasumi_2008_albedo(image):
+    """
+    Tasumi et al. (2008) - METRIC broadband albedo
+    
+    Reference: Tasumi, M., Allen, R. G., & Trezza, R. (2008). At-surface 
+    reflectance and albedo from satellite for operational calculation of land 
+    surface energy balance. Journal of Hydrologic Engineering, 13(2), 51-63.
+    
+    Formula for Landsat 7:
+    α = 0.254*ρ1 + 0.149*ρ2 + 0.147*ρ3 + 0.311*ρ4 + 0.103*ρ5 + 0.036*ρ7
+    """
+    blue = image.select('SR_B1')
+    green = image.select('SR_B2')
+    red = image.select('SR_B3')
+    nir = image.select('SR_B4')
+    swir1 = image.select('SR_B5')
+    swir2 = image.select('SR_B7')
+    
+    albedo = blue.multiply(0.254).add(
+             green.multiply(0.149)).add(
+             red.multiply(0.147)).add(
+             nir.multiply(0.311)).add(
+             swir1.multiply(0.103)).add(
+             swir2.multiply(0.036))
+    
+    albedo = albedo.clamp(0, 1)
+    
+    return albedo.rename('albedo_tasumi2008')
+
+def calculate_silva_2016_albedo(image):
+    """
+    Silva et al. (2016) - Modified albedo for Landsat
+    
+    Reference: Silva, B. B., Braga, A. C., Braga, C. C., de Oliveira, L. M., 
+    Montenegro, S. M., & Barbosa Junior, B. (2016). Procedures for calculation 
+    of the albedo with OLI-Landsat 8 images: Application to the Brazilian 
+    semi-arid. Revista Brasileira de Engenharia Agrícola e Ambiental, 20(1), 3-8.
+    
+    Adapted coefficients for Landsat 7 ETM+:
+    α = 0.300*ρ1 + 0.277*ρ2 + 0.233*ρ3 + 0.143*ρ4 + 0.036*ρ5 + 0.012*ρ7
+    """
+    blue = image.select('SR_B1')
+    green = image.select('SR_B2')
+    red = image.select('SR_B3')
+    nir = image.select('SR_B4')
+    swir1 = image.select('SR_B5')
+    swir2 = image.select('SR_B7')
+    
+    albedo = blue.multiply(0.300).add(
+             green.multiply(0.277)).add(
+             red.multiply(0.233)).add(
+             nir.multiply(0.143)).add(
+             swir1.multiply(0.036)).add(
+             swir2.multiply(0.012))
+    
+    albedo = albedo.clamp(0, 1)
+    
+    return albedo.rename('albedo_silva2016')
+
+def calculate_simple_visible_nir_albedo(image):
+    """
+    Simple visible-NIR albedo
+    
+    A simple approach using the average of visible (R, G, B) and NIR bands
+    α = (ρ_red + ρ_nir) / 2
+    
+    Alternative formulation (weighted):
+    α = 0.5*ρ_visible + 0.5*ρ_nir
+    where ρ_visible = (ρ_red + ρ_green + ρ_blue) / 3
+    """
+    blue = image.select('SR_B1')
+    green = image.select('SR_B2')
+    red = image.select('SR_B3')
+    nir = image.select('SR_B4')
+    
+    # Calculate average visible
+    visible = blue.add(green).add(red).divide(3)
+    
+    # Simple average of visible and NIR
+    albedo = visible.add(nir).divide(2)
+    
+    albedo = albedo.clamp(0, 1)
+    
+    return albedo.rename('albedo_simple_vis_nir')
+
+def calculate_knap_1999_albedo(image):
+    """
+    Knap et al. (1999) - Glacier-specific narrowband-to-broadband conversion
+    
+    Reference: Knap, W. H., Reijmer, C. H., & Oerlemans, J. (1999). 
+    Narrowband to broadband conversion of Landsat TM glacier albedos. 
+    International Journal of Remote Sensing, 20(10), 2091-2110.
+    
+    Formula for Landsat TM/ETM+ (bands 2 and 4):
+    α = 0.726*ρ2 + 0.322*ρ4 - 0.015
+    
+    where:
+    ρ2 = Band 2 (green)
+    ρ4 = Band 4 (NIR)
+    
+    This is specifically calibrated for glacier surfaces
+    """
+    green = image.select('SR_B2')  # Band 2: 0.52-0.60 μm
+    nir = image.select('SR_B4')    # Band 4: 0.77-0.90 μm
+    
+    albedo = green.multiply(0.726).add(
+             nir.multiply(0.322)).subtract(0.015)
+    
+    albedo = albedo.clamp(0, 1)
+    
+    return albedo.rename('albedo_knap1999')
+
+# ==============================================================================
+# CALCULATE ALBEDO FOR ALL IMAGES AND ALGORITHMS
+# ==============================================================================
+
+def calculate_all_albedos(image):
+    """Apply all albedo algorithms to an image"""
+    liang = calculate_liang_2001_albedo(image)
+    tasumi = calculate_tasumi_2008_albedo(image)
+    silva = calculate_silva_2016_albedo(image)
+    simple = calculate_simple_visible_nir_albedo(image)
+    knap = calculate_knap_1999_albedo(image)
+    
+    # Add all albedo bands to the image
+    return image.addBands([liang, tasumi, silva, simple, knap])
+
+print("\n" + "="*70)
+print("CALCULATING ALBEDO FOR ALL ALGORITHMS")
+print("="*70)
+
+# Apply all algorithms to the collection
+albedo_collection = collection.map(calculate_all_albedos)
+
+# Algorithm names for iteration
+algorithm_names = [
+    'albedo_liang2001',
+    'albedo_tasumi2008',
+    'albedo_silva2016',
+    'albedo_simple_vis_nir',
+    'albedo_knap1999'
+]
+
+algorithm_labels = {
+    'albedo_liang2001': 'Liang (2001)',
+    'albedo_tasumi2008': 'Tasumi et al. (2008)',
+    'albedo_silva2016': 'Silva et al. (2016)',
+    'albedo_simple_vis_nir': 'Simple Visible-NIR',
+    'albedo_knap1999': 'Knap et al. (1999)'
+}
+
+# ==============================================================================
+# ALBEDO FILTERING THRESHOLDS
+# ==============================================================================
+
+# Physical albedo constraints for glacier surfaces
+ALBEDO_MIN = 0.15  # Below this = rock/debris (exclude)
+ALBEDO_MAX = 0.85  # Above this = likely clouds (exclude)
+
+print("\n" + "="*70)
+print("ALBEDO FILTERING SETTINGS")
+print("="*70)
+print(f"  Minimum valid albedo: {ALBEDO_MIN} (excludes rock/debris)")
+print(f"  Maximum valid albedo: {ALBEDO_MAX} (excludes cloud contamination)")
+print(f"  Valid range for glacier ice/snow: {ALBEDO_MIN} - {ALBEDO_MAX}")
+
+# ==============================================================================
+# CALCULATE STATISTICS WITH FILTERING
+# ==============================================================================
+
+def calculate_glacier_statistics(image, glacier_fc, glacier_name, date):
+    """
+    Calculate mean albedo statistics for a glacier using all algorithms
+    WITH filtering to remove rock/debris and cloud contamination
+    """
+    stats = {'date': date, 'glacier': glacier_name}
+    
+    for algo in algorithm_names:
+        # Get albedo band
+        albedo_band = image.select(algo)
+        
+        # Create mask for valid albedo values (0.15 - 0.85)
+        valid_mask = albedo_band.gte(ALBEDO_MIN).And(albedo_band.lte(ALBEDO_MAX))
+        
+        # Apply mask
+        filtered_albedo = albedo_band.updateMask(valid_mask)
+        
+        # Calculate mean albedo over the glacier with filtering
+        mean_dict = filtered_albedo.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=glacier_fc.geometry(),
+            scale=30,  # Landsat 7 resolution
+            maxPixels=1e9
+        )
+        
+        mean_value = mean_dict.getInfo()
+        stats[algo] = mean_value.get(algo, np.nan)
+        
+        # Also calculate percentage of valid pixels (for quality assessment)
+        if algo == algorithm_names[0]:  # Only calculate once per glacier
+            valid_pixels = valid_mask.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=glacier_fc.geometry(),
+                scale=30,
+                maxPixels=1e9
+            ).getInfo()
+            stats['valid_pixel_fraction'] = valid_pixels.get(algo, np.nan)
+    
+    return stats
+
+print("\n" + "="*70)
+print("CALCULATING GLACIER STATISTICS (WITH FILTERING)")
+print("="*70)
+
+all_statistics = []
+
+# Process each image
+for date in TARGET_DATES:
+    print(f"\nProcessing date: {date}")
+    
+    # Get the image for this date
+    image = albedo_collection.filter(ee.Filter.eq('DATE_ACQUIRED', date)).first()
+    
+    # Calculate statistics for Hansbreen
+    print(f"  Calculating Hansbreen statistics...")
+    hansbreen_stats = calculate_glacier_statistics(image, hansbreen, 'Hansbreen', date)
+    all_statistics.append(hansbreen_stats)
+    if 'valid_pixel_fraction' in hansbreen_stats:
+        print(f"    Valid pixels: {hansbreen_stats['valid_pixel_fraction']*100:.1f}%")
+    
+    # Calculate statistics for Werenskioldbreen
+    print(f"  Calculating Werenskioldbreen statistics...")
+    werenskioldbreen_stats = calculate_glacier_statistics(image, werenskioldbreen, 'Werenskioldbreen', date)
+    all_statistics.append(werenskioldbreen_stats)
+    if 'valid_pixel_fraction' in werenskioldbreen_stats:
+        print(f"    Valid pixels: {werenskioldbreen_stats['valid_pixel_fraction']*100:.1f}%")
+    
+    # Calculate statistics for combined system
+    print(f"  Calculating combined glacier system statistics...")
+    combined_stats = calculate_glacier_statistics(image, combined_glaciers, 'Combined_System', date)
+    all_statistics.append(combined_stats)
+    if 'valid_pixel_fraction' in combined_stats:
+        print(f"    Valid pixels: {combined_stats['valid_pixel_fraction']*100:.1f}%")
+
+# Convert to DataFrame
+df_results = pd.DataFrame(all_statistics)
+
+print("\n" + "="*70)
+print("RESULTS SUMMARY")
+print("="*70)
+print("\nAlbedo Statistics:")
+print(df_results.to_string(index=False))
+
+# ==============================================================================
+# CALCULATE TEMPORAL CHANGES
+# ==============================================================================
+
+print("\n" + "="*70)
+print("CALCULATING TEMPORAL CHANGES (August - July)")
+print("="*70)
+
+temporal_changes = []
+
+for glacier_name in ['Hansbreen', 'Werenskioldbreen', 'Combined_System']:
+    glacier_data = df_results[df_results['glacier'] == glacier_name].sort_values('date')
+    
+    if len(glacier_data) == 2:
+        july_data = glacier_data.iloc[0]
+        august_data = glacier_data.iloc[1]
+        
+        change_stats = {'glacier': glacier_name}
+        
+        for algo in algorithm_names:
+            july_value = july_data[algo]
+            august_value = august_data[algo]
+            
+            if not np.isnan(july_value) and not np.isnan(august_value):
+                absolute_change = august_value - july_value
+                relative_change = (absolute_change / july_value) * 100 if july_value != 0 else np.nan
+                
+                change_stats[f'{algo}_absolute'] = absolute_change
+                change_stats[f'{algo}_relative_pct'] = relative_change
+            else:
+                change_stats[f'{algo}_absolute'] = np.nan
+                change_stats[f'{algo}_relative_pct'] = np.nan
+        
+        temporal_changes.append(change_stats)
+
+df_changes = pd.DataFrame(temporal_changes)
+
+print("\nTemporal Changes (Absolute):")
+for glacier_name in ['Hansbreen', 'Werenskioldbreen', 'Combined_System']:
+    print(f"\n{glacier_name}:")
+    glacier_changes = df_changes[df_changes['glacier'] == glacier_name]
+    
+    for algo in algorithm_names:
+        abs_col = f'{algo}_absolute'
+        if abs_col in glacier_changes.columns:
+            abs_change = glacier_changes[abs_col].values[0]
+            print(f"  {algorithm_labels[algo]}: {abs_change:+.4f}")
+
+print("\nTemporal Changes (Relative %):")
+for glacier_name in ['Hansbreen', 'Werenskioldbreen', 'Combined_System']:
+    print(f"\n{glacier_name}:")
+    glacier_changes = df_changes[df_changes['glacier'] == glacier_name]
+    
+    for algo in algorithm_names:
+        rel_col = f'{algo}_relative_pct'
+        if rel_col in glacier_changes.columns:
+            rel_change = glacier_changes[rel_col].values[0]
+            print(f"  {algorithm_labels[algo]}: {rel_change:+.2f}%")
+
+# ==============================================================================
+# VISUALIZATION
+# ==============================================================================
+
+print("\n" + "="*70)
+print("CREATING VISUALIZATIONS")
+print("="*70)
+
+# Prepare data for plotting
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+fig.suptitle('Glacier Albedo Comparison: Multi-Algorithm Analysis\nJuly 26 vs August 20, 2011', 
+             fontsize=16, fontweight='bold')
+
+glacier_names = ['Hansbreen', 'Werenskioldbreen', 'Combined_System']
+glacier_labels = ['Hansbreen', 'Werenskioldbreen', 'Combined System']
+
+for idx, (glacier_name, glacier_label) in enumerate(zip(glacier_names, glacier_labels)):
+    ax_temporal = axes[0, idx]
+    ax_change = axes[1, idx]
+    
+    # Get data for this glacier
+    glacier_data = df_results[df_results['glacier'] == glacier_name].sort_values('date')
+    
+    if len(glacier_data) == 2:
+        # Temporal plot
+        x_pos = np.arange(len(algorithm_names))
+        width = 0.35
+        
+        july_values = [glacier_data.iloc[0][algo] for algo in algorithm_names]
+        august_values = [glacier_data.iloc[1][algo] for algo in algorithm_names]
+        
+        ax_temporal.bar(x_pos - width/2, july_values, width, label='July 26', alpha=0.8)
+        ax_temporal.bar(x_pos + width/2, august_values, width, label='August 20', alpha=0.8)
+        
+        ax_temporal.set_ylabel('Albedo', fontsize=11)
+        ax_temporal.set_title(f'{glacier_label}', fontsize=12, fontweight='bold')
+        ax_temporal.set_xticks(x_pos)
+        ax_temporal.set_xticklabels([algorithm_labels[algo].replace(' et al.', '').replace(' (', '\n(') 
+                                      for algo in algorithm_names], 
+                                     rotation=45, ha='right', fontsize=9)
+        ax_temporal.legend(fontsize=9)
+        ax_temporal.grid(axis='y', alpha=0.3)
+        ax_temporal.set_ylim(0, 1)
+        
+        # Change plot
+        glacier_changes = df_changes[df_changes['glacier'] == glacier_name]
+        change_values = [glacier_changes[f'{algo}_absolute'].values[0] for algo in algorithm_names]
+        
+        colors = ['red' if v < 0 else 'green' for v in change_values]
+        ax_change.bar(x_pos, change_values, color=colors, alpha=0.7)
+        
+        ax_change.set_ylabel('Albedo Change\n(August - July)', fontsize=11)
+        ax_change.set_xticks(x_pos)
+        ax_change.set_xticklabels([algorithm_labels[algo].replace(' et al.', '').replace(' (', '\n(') 
+                                    for algo in algorithm_names], 
+                                   rotation=45, ha='right', fontsize=9)
+        ax_change.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
+        ax_change.grid(axis='y', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('glacier_albedo_analysis.png', dpi=300, bbox_inches='tight')
+print("✓ Saved visualization: glacier_albedo_analysis.png")
+
+# ==============================================================================
+# EXPORT RESULTS TO CSV
+# ==============================================================================
+
+print("\n" + "="*70)
+print("EXPORTING RESULTS")
+print("="*70)
+
+# Export main results
+output_file_results = 'glacier_albedo_results.csv'
+df_results.to_csv(output_file_results, index=False)
+print(f"✓ Saved results: {output_file_results}")
+
+# Export temporal changes
+output_file_changes = 'glacier_albedo_temporal_changes.csv'
+df_changes.to_csv(output_file_changes, index=False)
+print(f"✓ Saved temporal changes: {output_file_changes}")
+
+# Create a summary report
+summary_report = []
+summary_report.append("="*70)
+summary_report.append("GLACIER ALBEDO ANALYSIS - SUMMARY REPORT")
+summary_report.append("="*70)
+summary_report.append(f"\nStudy Period: {TARGET_DATES[0]} to {TARGET_DATES[1]}")
+summary_report.append(f"\nGlaciers Analyzed:")
+summary_report.append(f"  - Hansbreen: {hansbreen_area:.2f} km²")
+summary_report.append(f"  - Werenskioldbreen: {werenskioldbreen_area:.2f} km²")
+summary_report.append(f"  - Combined System: {combined_area:.2f} km²")
+summary_report.append(f"\nAlgorithms Used:")
+for algo in algorithm_names:
+    summary_report.append(f"  - {algorithm_labels[algo]}")
+
+summary_report.append("\n" + "="*70)
+summary_report.append("MEAN ALBEDO VALUES (FILTERED)")
+summary_report.append("="*70)
+summary_report.append(f"\nFiltering applied: {ALBEDO_MIN} - {ALBEDO_MAX}")
+summary_report.append(f"  < {ALBEDO_MIN}: Rock/debris excluded")
+summary_report.append(f"  > {ALBEDO_MAX}: Cloud contamination excluded")
+
+for glacier_name in glacier_names:
+    glacier_data = df_results[df_results['glacier'] == glacier_name].sort_values('date')
+    summary_report.append(f"\n{glacier_name}:")
+    
+    for idx, row in glacier_data.iterrows():
+        summary_report.append(f"\n  {row['date']}:")
+        if 'valid_pixel_fraction' in row and not pd.isna(row['valid_pixel_fraction']):
+            summary_report.append(f"    Valid pixels: {row['valid_pixel_fraction']*100:.1f}% (after filtering)")
+        for algo in algorithm_names:
+            value = row[algo]
+            summary_report.append(f"    {algorithm_labels[algo]}: {value:.4f}")
+
+summary_report.append("\n" + "="*70)
+summary_report.append("TEMPORAL CHANGES (August - July)")
+summary_report.append("="*70)
+
+for glacier_name in glacier_names:
+    glacier_changes = df_changes[df_changes['glacier'] == glacier_name]
+    summary_report.append(f"\n{glacier_name}:")
+    
+    for algo in algorithm_names:
+        abs_col = f'{algo}_absolute'
+        rel_col = f'{algo}_relative_pct'
+        
+        if abs_col in glacier_changes.columns:
+            abs_change = glacier_changes[abs_col].values[0]
+            rel_change = glacier_changes[rel_col].values[0]
+            
+            summary_report.append(f"  {algorithm_labels[algo]}:")
+            summary_report.append(f"    Absolute: {abs_change:+.4f}")
+            summary_report.append(f"    Relative: {rel_change:+.2f}%")
+
+# Save summary report (with UTF-8 encoding to handle special characters like ²)
+with open('glacier_albedo_summary_report.txt', 'w', encoding='utf-8') as f:
+    f.write('\n'.join(summary_report))
+
+print("✓ Saved summary report: glacier_albedo_summary_report.txt")
+
+# ==============================================================================
+# OPTIONAL: EXPORT MAPS TO GOOGLE DRIVE
+# ==============================================================================
+
+if EXPORT_MAPS:
+    print("\n" + "="*70)
+    print("EXPORTING ALBEDO MAPS TO GOOGLE DRIVE")
+    print("="*70)
+    print("Note: This will export GeoTIFF files to your Google Drive.")
+    print("You can monitor export progress at: https://code.earthengine.google.com/tasks")
+    
+    for date in TARGET_DATES:
+        image = albedo_collection.filter(ee.Filter.eq('DATE_ACQUIRED', date)).first()
+        
+        for algo in algorithm_names:
+            # Export parameters
+            export_params = {
+                'image': image.select(algo),
+                'description': f'{algo}_{date.replace("-", "")}',
+                'folder': 'GEE_Glacier_Albedo',
+                'scale': 30,
+                'region': combined_glaciers.geometry(),
+                'maxPixels': 1e9,
+                'fileFormat': 'GeoTIFF'
+            }
+            
+            # Create export task
+            task = ee.batch.Export.image.toDrive(**export_params)
+            task.start()
+            
+            print(f"  Started export: {algo} for {date}")
+    
+    print("\n✓ All export tasks initiated")
+    print("  Check task status at: https://code.earthengine.google.com/tasks")
+
+# ==============================================================================
+# FINAL SUMMARY
+# ==============================================================================
+
+print("\n" + "="*70)
+print("ANALYSIS COMPLETE!")
+print("="*70)
+print("\nGenerated Files:")
+print("  1. glacier_albedo_results.csv - All albedo values")
+print("  2. glacier_albedo_temporal_changes.csv - Temporal change analysis")
+print("  3. glacier_albedo_summary_report.txt - Comprehensive text report")
+print("  4. glacier_albedo_analysis.png - Visualization plots")
+
+if EXPORT_MAPS:
+    print("\nGeoTIFF exports initiated to Google Drive")
+    print("Monitor at: https://code.earthengine.google.com/tasks")
+
+print("\n" + "="*70)
+print("Thank you for using this albedo analysis tool!")
+print("Good luck with your PhD research! 🏔️")
+print("="*70)
